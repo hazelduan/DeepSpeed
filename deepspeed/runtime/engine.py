@@ -277,6 +277,8 @@ class DeepSpeedEngine(Module):
         self._do_args_sanity_check(args)
         self._configure_with_arguments(args, mpu)
         self._do_sanity_check()
+        self.pipeline_parallelism = isinstance(model, PipelineModule)
+        self._validate_hifloat8_configuration()
         if self.autotp_size() > 1:
             self._configure_tensor_parallel(model, self.tensor_parallel_config())
         see_memory_usage("DeepSpeed Engine: After args sanity test", force=self.memory_breakdown())
@@ -297,12 +299,11 @@ class DeepSpeedEngine(Module):
             force=self.memory_breakdown(),
         )
 
-        self.pipeline_parallelism = isinstance(model, PipelineModule)
-
         self._deepcompile_active = False
 
         # Configure distributed model
         self._configure_distributed_model(model)
+        self._configure_hifloat8()
 
         # These hooks should be disabled later if DeepCompile is not active.
         self.module_forward_pre_hook = self._create_module_forward_pre_hook()
@@ -1128,6 +1129,9 @@ class DeepSpeedEngine(Module):
     def bfloat16_enabled(self):
         return self._config.bfloat16_config.enabled
 
+    def hifloat8_enabled(self):
+        return self._config.hifloat8_config["enabled"]
+
     def fp16_master_weights_and_gradients(self):
         return self._config.float16_config.fp16_master_weights_and_grads
 
@@ -1446,6 +1450,94 @@ class DeepSpeedEngine(Module):
         modules['module'] = model
         # register module attribute in engine but avoid getattr
         self.__dict__['module'] = model
+
+    def _validate_hifloat8_configuration(self):
+        if not self.hifloat8_enabled():
+            return
+        if not self.bfloat16_enabled():
+            raise RuntimeError("HiFloat8 training requires DeepSpeed BF16 to be enabled")
+        if self.pipeline_parallelism:
+            raise RuntimeError("HiFloat8 training has not been validated with DeepSpeed PipelineModule")
+        if self.autotp_size() > 1:
+            raise RuntimeError("HiFloat8 training has not been validated with DeepSpeed AutoTP")
+        if self.mpu is not None:
+            raise RuntimeError("HiFloat8 training has not been validated with a custom model-parallel unit")
+        if self.zero_optimization_stage() >= ZeroStageEnum.weights:
+            raise RuntimeError("HiFloat8 phase-1 supports DeepSpeed ZeRO stages 0, 1, and 2 only")
+
+    def _configure_hifloat8(self):
+        if not self.hifloat8_enabled():
+            return
+        self._validate_hifloat8_configuration()
+
+        from fnmatch import fnmatchcase
+        from deepspeed.runtime.hifloat8 import (
+            assert_hifloat8_training_available,
+            convert_to_hifloat8_training,
+            get_hifloat8_linear_class,
+        )
+
+        config = self._config.hifloat8_config
+        patterns = config["module_name_patterns"]
+        min_numel = config["min_numel"]
+        selected_names = []
+        total_numel = 0
+        for name, module in self.module.named_modules():
+            matrix_numel = getattr(module, "in_features", 0) * getattr(module, "out_features", 0)
+            if (type(module) is torch.nn.Linear and matrix_numel >= min_numel
+                    and any(fnmatchcase(name, pattern) for pattern in patterns)):
+                selected_names.append(name)
+                total_numel += matrix_numel
+        if not selected_names:
+            raise RuntimeError(
+                "HiFloat8 module selection matched no nn.Linear modules; "
+                f"patterns={list(patterns)}, min_numel={min_numel}"
+            )
+
+        logger.info(
+            "HiFloat8 selected %d Linear modules (%d matrix elements); probing native kernels before conversion",
+            len(selected_names),
+            total_numel,
+        )
+        try:
+            assert_hifloat8_training_available(probe_kernel=True, device=self.device)
+        except (ImportError, RuntimeError) as error:
+            raise RuntimeError(
+                f"HiFloat8 selected {len(selected_names)} Linear modules ({total_numel} matrix elements), "
+                f"but native kernel validation failed before conversion: {error}"
+            ) from error
+        HiFloat8Linear = get_hifloat8_linear_class()
+        parameters_before = dict(self.module.named_parameters())
+        requires_grad_before = {name: parameter.requires_grad for name, parameter in parameters_before.items()}
+        state_keys_before = tuple(self.module.state_dict())
+        selected_set = set(selected_names)
+        converted = convert_to_hifloat8_training(
+            self.module,
+            module_filter_fn=lambda _module, name: name in selected_set,
+        )
+        self._set_client_model(converted)
+
+        parameters_after = dict(self.module.named_parameters())
+        if parameters_before.keys() != parameters_after.keys():
+            raise RuntimeError("HiFloat8 conversion changed model parameter names")
+        if any(parameters_after[name] is not parameter for name, parameter in parameters_before.items()):
+            raise RuntimeError("HiFloat8 conversion replaced a model Parameter object")
+        if any(parameters_after[name].requires_grad != requires_grad_before[name] for name in parameters_after):
+            raise RuntimeError("HiFloat8 conversion changed requires_grad state")
+        if tuple(self.module.state_dict()) != state_keys_before:
+            raise RuntimeError("HiFloat8 conversion changed state-dict keys")
+
+        modules_after = dict(self.module.named_modules())
+        missing = [name for name in selected_names if not isinstance(modules_after.get(name), HiFloat8Linear)]
+        if missing:
+            raise RuntimeError(f"HiFloat8 conversion did not replace selected modules: {missing}")
+        self.hifloat8_converted_module_names = tuple(selected_names)
+        logger.info(
+            "HiFloat8 training converted %d Linear modules (%d matrix elements): %s",
+            len(selected_names),
+            total_numel,
+            selected_names,
+        )
 
     def _configure_distributed_model(self, model):
         self._set_client_model(model)
