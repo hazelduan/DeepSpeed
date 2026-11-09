@@ -61,6 +61,7 @@ def parse_autoep_config(param_dict: dict) -> AutoEPConfig:
     config.score_apply = param_dict.get("score_apply", "auto")
     config.combine_impl = param_dict.get("combine_impl", "auto")
     config.row_weighting_impl = param_dict.get("row_weighting_impl", "auto")
+    config.gate_up_impl = param_dict.get("gate_up_impl", "separate")
     config.comm_backend = param_dict.get("comm_backend", "comm")
     config.comm_num_sm = param_dict.get("comm_num_sm", 12)
     config.comm_qp_margin = param_dict.get("comm_qp_margin", 4)
@@ -113,8 +114,8 @@ def validate_autoep_config(
     tp_preset_model: str | None = None,
     use_data_before_expert_parallel: bool = False,
     mpu=None,
-    zero_offload_optimizer: bool = False,
-    zero_offload_param: bool = False,
+    offload_optimizer_device: str | None = None,
+    offload_param_device: str | None = None,
 ) -> None:
     """Validate config constraints. Raises ValueError on invalid config."""
     if config.load_balance_coeff is not None:
@@ -167,8 +168,8 @@ def validate_autoep_config(
         autoep_enabled=config.enabled,
         tp_preset=tp_preset_model,
         ep_preset=config.preset_model,
-        zero_offload_optimizer=zero_offload_optimizer,
-        zero_offload_param=zero_offload_param,
+        offload_optimizer_device=offload_optimizer_device,
+        offload_param_device=offload_param_device,
     )
 
     # Validate preset_model if specified
@@ -193,6 +194,14 @@ def validate_autoep_config(
     if config.row_weighting_impl not in valid_row_weighting_impl:
         raise ValueError(f"row_weighting_impl must be one of {valid_row_weighting_impl}, "
                          f"got '{config.row_weighting_impl}'")
+
+    valid_gate_up_impl = ("separate", "fused")
+    if config.gate_up_impl not in valid_gate_up_impl:
+        raise ValueError(f"gate_up_impl must be one of {valid_gate_up_impl}, got '{config.gate_up_impl}'")
+    if config.gate_up_impl == "fused" and not config.use_grouped_mm:
+        raise ValueError('gate_up_impl="fused" runs the gate and up projections as one torch._grouped_mm, but '
+                         "use_grouped_mm=false selects the sequential expert loop. Set use_grouped_mm=true, or "
+                         "leave gate_up_impl unset.")
 
     # Validate comm_backend
     valid_comm_backend = ("comm", "deepep")
