@@ -465,6 +465,17 @@ def _run_experts_with_grouped_mm(w1,
     return torch.cat((output, output.new_zeros((x.shape[0] - rows, output.shape[-1]))))
 
 
+class _AcceleratorGroupedGemm(nn.Module):
+    """Stateless GEMM leaf; the expert container owns weights and routing."""
+
+    def __init__(self, operation):
+        super().__init__()
+        self.operation = operation
+
+    def forward(self, x, weight, offsets, trans_b=False):
+        return self.operation(x, weight, offsets, trans_b=trans_b)
+
+
 class GroupedExperts(nn.Module):
     """Grouped expert computation for MoE layers.
 
@@ -525,7 +536,7 @@ class GroupedExperts(nn.Module):
         self.w3.is_expert_group = True
         self.use_triton_grouped_mm = False
         self.use_grouped_mm = use_grouped_mm
-        self.grouped_mm = None
+        self.grouped_mm = _AcceleratorGroupedGemm(get_accelerator().get_grouped_mm())
 
         # Resolve the Triton path. The device-specific decision is delegated to
         # the accelerator backend (e.g. the CUDA backend prefers Triton on
@@ -535,7 +546,7 @@ class GroupedExperts(nn.Module):
             self.use_triton_grouped_mm = get_accelerator().prefer_triton_grouped_mm()
 
         if (use_grouped_mm and not hasattr(torch, "_grouped_mm") and not self.use_triton_grouped_mm
-                and get_accelerator().get_grouped_mm() is None):
+                and self.grouped_mm.operation is None):
             raise RuntimeError("GroupedExperts was constructed with use_grouped_mm=True but "
                                "torch._grouped_mm is not available in this PyTorch build. "
                                "Upgrade PyTorch to a build that provides torch._grouped_mm, install "
@@ -572,12 +583,12 @@ class GroupedExperts(nn.Module):
         """
 
         act = (self.activation, self.activation_alpha, self.activation_limit)
-        grouped_mm = self.grouped_mm
-        accelerator = get_accelerator()
-        if grouped_mm is None and self.use_grouped_mm and accelerator.on_accelerator(x):
-            grouped_mm = accelerator.get_grouped_mm()
-        if grouped_mm is not None:
-            if getattr(self, "gate_up_impl", "auto") == "fused":
+        # AO converts the stateless leaf in place, including when the
+        # unquantized configuration would use the sequential expert loop.
+        converted = type(self.grouped_mm) is not _AcceleratorGroupedGemm
+        if converted or (self.use_grouped_mm and self.grouped_mm.operation is not None
+                         and get_accelerator().on_accelerator(x)):
+            if self.gate_up_impl == "fused":
                 raise RuntimeError("The accelerator grouped GEMM override requires separate gate/up projections")
             return _run_experts_with_grouped_mm(self.w1,
                                                 self.w2,
@@ -585,7 +596,7 @@ class GroupedExperts(nn.Module):
                                                 x,
                                                 num_tokens_per_expert,
                                                 *act,
-                                                grouped_mm=grouped_mm)
+                                                grouped_mm=self.grouped_mm)
         if self.use_triton_grouped_mm:
             return _run_experts_triton_grouped_mm(self.w1, self.w2, self.w3, x, num_tokens_per_expert, *act)
         elif self.use_grouped_mm:

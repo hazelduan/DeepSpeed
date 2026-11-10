@@ -110,9 +110,10 @@ def test_npu_hifloat8_expert_forward_and_gradients(counts, dim, hidden_dim, back
     candidate.load_state_dict(baseline.state_dict())
     if backend == "torchao":
         from torchao.quantization import quantize_
-        from torchao.hifloat8 import HiFloat8GroupedConfig
+        from torchao.hifloat8 import HiFloat8GMMConfig
 
-        quantize_(candidate, HiFloat8GroupedConfig(), filter_fn=lambda module, name: name == "")
+        policy = HiFloat8GMMConfig(input_dst_type_max=15, weight_dst_type_max=15, grad_dst_type_max=224)
+        quantize_(candidate, policy, filter_fn=lambda module, name: name == "grouped_mm")
     x = torch.randn(sum(counts), dim, device="npu", dtype=torch.bfloat16, requires_grad=True)
     candidate_x = x.detach().clone().requires_grad_()
     groups = torch.tensor(counts, device="npu", dtype=torch.int64)
@@ -199,10 +200,10 @@ def test_npu_provider_experts_preserve_bfloat16_residual_with_float16_compute():
     parameters = dict(experts.named_parameters())
     state_keys = tuple(experts.state_dict())
     from torchao.quantization import quantize_
-    from torchao.hifloat8 import HiFloat8GroupedConfig
+    from torchao.hifloat8 import HiFloat8GMMConfig
 
-    policy = HiFloat8GroupedConfig.from_dict({"compute_dtype": "float16"})
-    quantize_(experts, policy, filter_fn=lambda module, name: name == "")
+    policy = HiFloat8GMMConfig.from_dict({"compute_dtype": "float16"})
+    quantize_(experts, policy, filter_fn=lambda module, name: name == "grouped_mm")
     counts = torch.tensor([0, 8, 0, 4], device="npu", dtype=torch.int64)
     x = torch.randn(15, 64, device="npu", dtype=torch.bfloat16, requires_grad=True)
     branch = experts(x, counts)
@@ -231,9 +232,11 @@ def test_grouped_override_rejects_explicit_fused_gate_up():
     experts = GroupedExperts(8, 16, 2, use_grouped_mm=False)
     experts.gate_up_impl = "fused"
 
-    def unexpected_kernel(*args, **kwargs):
-        raise AssertionError("Unsupported execution must fail before a GEMM")
+    class UnexpectedKernel(torch.nn.Module):
 
-    experts.grouped_mm = unexpected_kernel
+        def forward(self, *args, **kwargs):
+            raise AssertionError("Unsupported execution must fail before a GEMM")
+
+    experts.grouped_mm = UnexpectedKernel()
     with pytest.raises(RuntimeError, match="separate gate/up"):
         experts(torch.randn(2, 8), torch.tensor([1, 1]))

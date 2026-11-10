@@ -215,8 +215,8 @@ class DeepSpeedAccelerator(ABC):
     def prefer_triton_grouped_mm(self):
         return False
 
-    def get_hifloat8_provider(self):
-        """Return optional public HiFloat8 APIs for this accelerator."""
+    def get_training_quantization_config(self, format_name):
+        """Return the optional AO config class for this training format."""
         return None
 
     def get_grouped_mm(self):
