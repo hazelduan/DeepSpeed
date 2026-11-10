@@ -5,9 +5,8 @@
 title: "TorchAO HiFloat8 training"
 ---
 
-DeepSpeed selects ordinary Linear and AutoEP GroupedExperts modules, probes the
-active accelerator's optional HiFloat8 APIs, and converts both kinds through one
-public `torchao.quantization.quantize_` call. DeepSpeed owns selection, activation,
+DeepSpeed selects ordinary Linear and AutoEP GroupedExperts modules and converts
+both kinds through one public `torchao.quantization.quantize_` call. DeepSpeed owns selection, activation,
 routing/padding, communication, optimizer and checkpoint lifecycle. TorchAO owns
 numerical policy and the quantization/GEMM implementations.
 
@@ -20,11 +19,12 @@ AutoEP topology, batch size and optimizer settings remain in that configuration.
 {
   "bf16": {"enabled": true},
   "zero_optimization": {"stage": 2},
-  "hifloat8": {
-    "enabled": true,
-    "backend": "torchao",
-    "module_name_patterns": ["*.experts", "*.shared_experts.*_proj"],
-    "min_numel": 65536
+  "quantization": {
+    "hifloat8": {
+      "enabled": true,
+      "module_name_patterns": ["*.experts", "*.shared_experts.*_proj"],
+      "min_numel": 65536
+    }
   }
 }
 ```
@@ -43,33 +43,24 @@ engine, optimizer, _, _ = deepspeed.initialize(
 ```
 
 For a Dense-only model, omit AutoEP and select the actual Linear module names.
-Set `hifloat8.enabled=false` to return to the high-precision path.
+Set `quantization.hifloat8.enabled=false` to return to the high-precision path.
 
 AutoEP topology and trainable-parameter selection are configured separately.
 Every pattern must match an eligible module. Optional `expected_module_count`
-checks the complete selection before backend loading. The existing schema is
-retained; legacy `backend="torchao_npu"` normalizes to `"torchao"`. The former
-`torch_npu` training-helper backend and the temporary `low_precision` section are
-rejected with a migration instruction.
+checks the complete selection before backend loading. The `quantization`
+section gives each training format its own module selection. HiFloat8 is the
+first supported format. Existing top-level `hifloat8` files and the
+`backend="torchao_npu"` alias still work. Use one location for HiFloat8 options.
 
 ## Conversion and device ownership
 
-`DeepSpeedAccelerator.get_hifloat8_provider()` defaults to `None`. The NPU
-implementation lazily returns the public `torchao.hifloat8` APIs after checking
-optional dependency/version availability. Unsupported accelerators fail before
-conversion. No NPU import or device-specific kernel selection occurs in Engine.
-
-`ModuleFqnToConfig` maps selected Linear modules to `HiFloat8Config` and selected
-experts to AO's `HiFloat8GroupedConfig`. Both parse the same numerical settings
-through their common `HiFloat8Config` base. Each recipe is immutable and reused
-across its selected modules; no nested policy wrapper is needed.
-Both handlers are registered by AO. The grouped handler binds AO's existing GEMM
-through the module's `grouped_mm` slot; it does not import a DeepSpeed container.
-Engine selects configurations and calls `quantize_`, without defining a handler
-or selecting a grouped function. Both preserve Parameter identity, names, metadata, `requires_grad`,
-mode and state-dict keys. There is no second model-conversion API or registry.
-The expert container remains owned by DeepSpeed and retains its activation and
-routing/padding behavior.
+The NPU accelerator resolves the public TorchAO `HiFloat8Config` class.
+DeepSpeed maps the selected Linear modules and AutoEP grouped GEMM leaves
+to the configuration using `FqnToConfig`. AO parses the recipe and converts
+the modules in one `quantize_` call. DeepSpeed keeps expert parameters,
+activation, routing and padding on the expert container. The GEMM leaf
+receives packed weights and their layout on each call, so quantization
+preserves parameter identity and checkpoint keys.
 
 The separate `get_grouped_mm()` accelerator hook supplies ordinary high-precision
 GEMM. Its NPU implementation calls TorchNPU with explicit list-input autograd,
@@ -81,18 +72,15 @@ its existing implementation.
 
 ## Optional TorchAO policy
 
-Install `torchao>=0.18,<0.19` and the paired Ascend extension with public HiFloat8
-policy/probe APIs and registered handlers. Selected experts additionally require
-`HiFloat8GroupedConfig`; Dense-only selection does not require grouped exports.
-With the extension's automatic activation enabled, DeepSpeed imports
-`torchao.hifloat8`; users do not need to import `torchao_npu` or convert the model
-manually. Upstream TorchAO alone does not provide this HiFloat8 implementation.
-Missing APIs, versions,
-invalid policy or unavailable requested forward/dX/dW kernels fail before
-conversion; policy parsing uses `HiFloat8Config.from_dict`.
+Install `torchao>=0.18,<0.19`, Triton and the official Ascend extension
+with the composite `HiFloat8Config` and automatic activation enabled.
+The accelerator resolves the dependency only when HiFloat8 is enabled.
+DeepSpeed validates selected modules and calls `HiFloat8Config.from_dict`
+before conversion. Verify native HiFloat8 forward, input-gradient and
+weight-gradient kernels on the target hardware before training.
 
 Missing, null or empty `config` uses the established input/weight/gradient scale
-denominators `15/15/224`. Explicit overrides remain supported. `compute_dtype`
+denominators `15/15/224`. An explicit null range uses the native AO default. `compute_dtype`
 selects high-precision staging and GEMM output precision (`null`, `"bfloat16"`
 or `"float16"`); operands remain HiFloat8 payloads and accumulation is
 kernel-owned. Converted Linear and expert modules return their caller's dtype,

@@ -159,17 +159,12 @@ value other than ``False`` instead of silently changing the requested behavior.
 
 **Optional HiFloat8 training:**
 
-The accelerator's ``get_hifloat8_provider()`` hook supplies public TorchAO
-policy, capability-probe and recipe APIs, or ``None`` when unavailable.
-With the existing ``hifloat8`` configuration, selected Linear and GroupedExperts
-modules are converted together by ``torchao.quantization.quantize_`` using
-``ModuleFqnToConfig`` and registered module handlers. Policy parsing belongs to
-TorchAO; selection and training lifecycle checks belong to DeepSpeed.
-The engine creates AO's ``HiFloat8GroupedConfig`` from the same numerical
-settings as Linear. Both configurations inherit the common policy. AO
-registers both module handlers; its grouped handler binds the GEMM through the
-expert container's ``grouped_mm`` slot without importing DeepSpeed. The
-accelerator supplies public configuration/probe APIs, not a GEMM callable.
+The ``quantization.hifloat8`` section selects Linear and GroupedExperts
+modules. On NPU the accelerator resolves the public TorchAO HiFloat8 config.
+DeepSpeed maps the selected Linear and stateless grouped GEMM leaves to
+that config and calls ``torchao.quantization.quantize_`` once. AO owns the
+config parsing and GEMM handlers. DeepSpeed keeps the expert parameters,
+routing, padding and activation on the expert container.
 
 The separate ``get_grouped_mm()`` hook supplies high-precision grouped GEMM.
 On NPU it uses TorchNPU autograd without a TorchAO dependency. HiFloat8 requires
