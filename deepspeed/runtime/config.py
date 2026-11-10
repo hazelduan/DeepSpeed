@@ -388,7 +388,10 @@ HIFLOAT8_DEFAULT = {
 def get_hifloat8_config(param_dict):
     if "low_precision" in param_dict:
         raise DeepSpeedConfigError("Use the existing hifloat8 section, not low_precision")
-    config = param_dict.get(HIFLOAT8, {})
+    return _parse_hifloat8_config(param_dict.get(HIFLOAT8, {}))
+
+
+def _parse_hifloat8_config(config):
     if not isinstance(config, dict):
         raise DeepSpeedConfigError(f"'{HIFLOAT8}' must be an object, got {type(config).__name__}")
 
@@ -423,6 +426,23 @@ def get_hifloat8_config(param_dict):
         raise DeepSpeedConfigError("'hifloat8.expected_module_count' must be a positive integer or null")
     result["module_name_patterns"] = tuple(patterns)
     return result
+
+
+def get_quantization_config(param_dict):
+    """Normalize training quantization options, including the legacy HiFloat8 section."""
+    if "low_precision" in param_dict:
+        raise DeepSpeedConfigError("Use quantization.hifloat8 instead of low_precision")
+    if "quantization" not in param_dict:
+        return {HIFLOAT8: get_hifloat8_config(param_dict)} if HIFLOAT8 in param_dict else {}
+    if HIFLOAT8 in param_dict:
+        raise DeepSpeedConfigError("Set HiFloat8 options only under quantization.hifloat8")
+    options = param_dict["quantization"]
+    if not isinstance(options, dict):
+        raise DeepSpeedConfigError("'quantization' must be an object")
+    unknown = sorted(set(options) - {HIFLOAT8})
+    if unknown:
+        raise DeepSpeedConfigError(f"Unknown training quantization formats: {unknown}")
+    return {HIFLOAT8: _parse_hifloat8_config(options[HIFLOAT8])} if HIFLOAT8 in options else {}
 
 
 def get_expert_data_topo_config(param_dict):
@@ -591,7 +611,8 @@ class DeepSpeedConfig(object):
 
         self.use_data_before_expert_parallel_ = get_expert_data_topo_config(param_dict)
         self.hybrid_engine = get_hybrid_engine_config(param_dict)
-        self.hifloat8_config = get_hifloat8_config(param_dict)
+        self.quantization_config = get_quantization_config(param_dict)
+        self.hifloat8_config = self.quantization_config.get(HIFLOAT8, HIFLOAT8_DEFAULT.copy())
 
         self.pipeline = get_pipeline_config(param_dict)
 

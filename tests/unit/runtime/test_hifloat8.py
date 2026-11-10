@@ -9,7 +9,7 @@ import pytest
 import torch
 from torch import nn
 
-from deepspeed.runtime.config import DeepSpeedConfigError, get_hifloat8_config
+from deepspeed.runtime.config import DeepSpeedConfigError, get_hifloat8_config, get_quantization_config
 from deepspeed.runtime.engine import DeepSpeedEngine
 
 # Native tests require the public API; a missing extension must fail there.
@@ -516,3 +516,18 @@ def test_public_quantize_entry_converts_dense_and_grouped_in_place(monkeypatch, 
     assert bool(torch.isfinite(x.grad).all())
     assert all(parameter.grad is not None and bool(torch.isfinite(parameter.grad).all())
                for parameter in model.parameters())
+
+
+def test_quantization_hifloat8_and_legacy_config_normalize_identically():
+    options = {"enabled": True, "module_name_patterns": ["*.experts"], "config": {"grad_dst_type_max": None}}
+    assert get_quantization_config({"quantization": {
+        "hifloat8": options
+    }}) == get_quantization_config({"hifloat8": options})
+    with pytest.raises(DeepSpeedConfigError, match="quantization.hifloat8"):
+        get_quantization_config({"quantization": {"hifloat8": options}, "hifloat8": options})
+
+
+@pytest.mark.parametrize("options", [[], None, {"fp8": {"enabled": True}}])
+def test_invalid_training_quantization_sections_fail_closed(options):
+    with pytest.raises(DeepSpeedConfigError):
+        get_quantization_config({"quantization": options})
