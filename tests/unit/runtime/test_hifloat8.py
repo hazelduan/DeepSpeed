@@ -25,6 +25,7 @@ def test_hifloat8_config_defaults_disabled():
         "min_numel": 0,
         "expected_module_count": None,
         "config": None,
+        "module_configs": None,
     }
 
 
@@ -440,3 +441,9 @@ def test_quantization_hifloat8_and_legacy_config_normalize_identically():
 def test_invalid_training_quantization_sections_fail_closed(options):
     with pytest.raises(DeepSpeedConfigError):
         get_quantization_config({"quantization": options})
+
+
+@pytest.mark.parametrize("module_configs", [[], True, {1: {}}, {"dense": []}, {"re:(": {}}])
+def test_invalid_module_recipe_structure_fails_during_config_parsing(module_configs):
+    with pytest.raises(DeepSpeedConfigError):
+        get_quantization_config({"quantization": {"hifloat8": {"module_configs": module_configs}}})

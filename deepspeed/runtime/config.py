@@ -4,6 +4,7 @@
 # DeepSpeed Team
 
 import os
+import re
 from typing import Union
 from enum import Enum
 
@@ -382,6 +383,7 @@ HIFLOAT8_DEFAULT = {
     "min_numel": 0,
     "expected_module_count": None,
     "config": None,
+    "module_configs": None,
 }
 
 
@@ -411,12 +413,27 @@ def _parse_hifloat8_config(config):
     if policy is not None:
         if not isinstance(policy, dict):
             raise DeepSpeedConfigError("'hifloat8.config' must be an object or null")
+    module_configs = result["module_configs"]
+    if module_configs is not None:
+        if not isinstance(module_configs, dict):
+            raise DeepSpeedConfigError("'hifloat8.module_configs' must be an object or null")
+        for selector, recipe in module_configs.items():
+            if not isinstance(selector, str):
+                raise DeepSpeedConfigError("'hifloat8.module_configs' keys must be module names or re: patterns")
+            if recipe is not None and not isinstance(recipe, dict):
+                raise DeepSpeedConfigError(f"HiFloat8 recipe for {selector!r} must be an object or null")
+            if selector.startswith("re:"):
+                try:
+                    re.compile(selector[3:])
+                except re.error as error:
+                    raise DeepSpeedConfigError(
+                        f"Invalid HiFloat8 module_configs regex {selector!r}: {error}") from error
     patterns = result["module_name_patterns"]
     if not isinstance(patterns,
                       (list, tuple)) or not all(isinstance(pattern, str) and pattern for pattern in patterns):
         raise DeepSpeedConfigError("'hifloat8.module_name_patterns' must be a list of non-empty strings")
-    if result["enabled"] and not patterns:
-        raise DeepSpeedConfigError("'hifloat8.module_name_patterns' cannot be empty when HiFloat8 is enabled")
+    if result["enabled"] and not patterns and not module_configs:
+        raise DeepSpeedConfigError("HiFloat8 requires module_name_patterns or module_configs when enabled")
     min_numel = result["min_numel"]
     if isinstance(min_numel, bool) or not isinstance(min_numel, int) or min_numel < 0:
         raise DeepSpeedConfigError("'hifloat8.min_numel' must be a non-negative integer")
