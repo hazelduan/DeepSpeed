@@ -4,6 +4,7 @@
 # DeepSpeed Team
 """Integration tests for AutoEP (multi-GPU, requires distributed backend)."""
 
+import math
 import os
 
 import pytest
@@ -183,6 +184,85 @@ class TestAutoEPOnly(DistributedTest):
 
 class TestAutoEPZero3ReplicaGroups(DistributedTest):
     world_size = 4
+
+    @pytest.mark.parametrize('zero_init', [False, True])
+    def test_zero3_hifloat8_recipes_resume_4gpu(self, tmpdir, zero_init):
+        # Catch shard-based selection and incorrect replay across EP2/EDP2 groups.
+        from deepspeed.accelerator import get_accelerator
+        if get_accelerator().device_name() != 'npu':
+            pytest.skip('Native HiFloat8 requires NPU')
+        from torchao.hifloat8 import HiFloat8GMM, HiFloat8Linear
+        from unit.runtime.hifloat8_resume_validation import compare_nested, snapshot
+        from unit.v1.moe.autoep_test_utils import MockMoEOnlyTransformer
+
+        config = _make_autoep_config(zero_stage=3, ep_size=2)
+        config.update(bf16={'enabled': True}, gradient_clipping=1.0)
+        config['optimizer']['params'].update(torch_adam=True)
+        config['zero_optimization'].update(overlap_comm=False,
+                                           reduce_bucket_size=1000000,
+                                           stage3_prefetch_bucket_size=0,
+                                           stage3_param_persistence_threshold=0,
+                                           stage3_max_reuse_distance=0)
+        config['quantization'] = {
+            'hifloat8': {
+                'enabled': True,
+                'min_numel': 4096,
+                'expected_module_count': 3,
+                'module_configs': {
+                    'model.layers.0.dense': {
+                        'grad_dst_type_max': 15
+                    },
+                    r're:model\.layers\.\d+\.mlp\.experts': {
+                        'grad_dst_type_max': 224
+                    },
+                },
+            }
+        }
+
+        def create():
+            _seed_everything(42)
+            with deepspeed.zero.Init(config_dict_or_path=config, enabled=zero_init):
+                model = MockMoEOnlyTransformer()
+            engine, _, _, _ = deepspeed.initialize(model=model, config=config)
+            assert isinstance(engine.module.model.layers[0].dense, HiFloat8Linear)
+            assert engine.module.model.layers[0].dense.config.grad_dst_type_max == 15
+            for layer in engine.module.model.layers:
+                assert isinstance(layer.mlp.experts.grouped_mm, HiFloat8GMM)
+                assert layer.mlp.experts.grouped_mm.config.grad_dst_type_max == 224
+            return engine
+
+        def full_state(engine):
+            with deepspeed.zero.GatheredParameters(engine.module.parameters()):
+                return snapshot(engine.module.state_dict())
+
+        def step(engine, batch):
+            loss = engine(batch).float().square().mean()
+            assert torch.isfinite(loss)
+            engine.backward(loss)
+            engine.step()
+            norm = float(engine.get_global_grad_norm())
+            assert math.isfinite(norm)
+            return loss.item(), norm
+
+        engine = create()
+        initial = full_state(engine)
+        batches = [torch.randn(1, 8, 64, device=engine.device, dtype=torch.bfloat16) for _ in range(20)]
+        expected = []
+        for index, batch in enumerate(batches):
+            expected.append(step(engine, batch))
+            if index == 1:
+                engine.save_checkpoint(str(tmpdir), tag='step2')
+        final = full_state(engine)
+        selected = [name for name in final if '.experts.' in name or name == 'model.layers.0.dense.weight']
+        assert all(not torch.equal(initial[name], final[name]) for name in selected)
+        optimizer_final = snapshot(engine.optimizer.state_dict())
+        resumed = create()
+        path, _ = resumed.load_checkpoint(str(tmpdir), tag='step2')
+        assert path and resumed.global_steps == 2
+        assert [step(resumed, batch) for batch in batches[2:]] == expected[2:]
+        compare_nested(final, full_state(resumed))
+        compare_nested(optimizer_final, resumed.optimizer.state_dict())
+        assert resumed.global_steps == 20
 
     def test_zero3_ep_source_zero_init_expert_replica_placement_4gpu(self):
         _seed_everything(3456)

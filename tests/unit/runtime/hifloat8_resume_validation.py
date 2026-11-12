@@ -1,7 +1,7 @@
 # Copyright (c) DeepSpeed Team.
 # SPDX-License-Identifier: Apache-2.0
 # DeepSpeed Team
-"""Opt-in NPU DP2 ZeRO-2 save/load validation for Dense and grouped HiFloat8.
+"""Opt-in NPU DP2 ZeRO save/load validation for Dense and grouped HiFloat8.
 
 Run with a valid two-device Ascend rank table and the optional TorchAO HiFloat8 extension installed::
 
@@ -13,12 +13,16 @@ parallel routing is validated separately with a model integration run.
 """
 import argparse
 import copy
+import hashlib
 import json
+import math
 import os
 from pathlib import Path
+import time
 
 import torch
 import torch_npu  # noqa: F401
+from torch.utils.checkpoint import checkpoint
 import deepspeed
 import deepspeed.comm as dist
 from deepspeed.moe.ep_experts import GroupedExperts
@@ -28,8 +32,9 @@ from torchao.hifloat8 import HiFloat8GMM, HiFloat8Linear
 
 class Model(torch.nn.Module):
 
-    def __init__(self):
+    def __init__(self, activation_checkpointing=False):
         super().__init__()
+        self.activation_checkpointing = activation_checkpointing
         self.dense = torch.nn.Linear(128, 128, bias=False)
         self.experts = GroupedExperts(128, 128, 2, use_grouped_mm=False)
         with torch.no_grad():
@@ -37,6 +42,11 @@ class Model(torch.nn.Module):
                 p.normal_(std=0.02)
 
     def forward(self, x):
+        if self.activation_checkpointing:
+            return checkpoint(self._forward, x, use_reentrant=True)
+        return self._forward(x)
+
+    def _forward(self, x):
         counts = torch.tensor((0, x.shape[0]), device=x.device, dtype=torch.int64)
         return self.experts(self.dense(x), counts)
 
@@ -75,7 +85,16 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--module-recipes', action='store_true')
+    parser.add_argument('--zero-stage', type=int, choices=(2, 3), default=2)
+    parser.add_argument('--zero-init', action='store_true')
+    parser.add_argument('--steps', type=int, default=8)
+    parser.add_argument('--freeze-first-expert', action='store_true')
+    parser.add_argument('--checkpoint', action='store_true')
     args = parser.parse_args()
+    if args.steps < 8 or args.steps % 2:
+        parser.error('--steps must be an even number of microsteps, at least 8')
+    if args.zero_init and args.zero_stage != 3:
+        parser.error('--zero-init requires --zero-stage 3')
     rank = int(os.environ['RANK'])
     torch.npu.set_device(int(os.environ['LOCAL_RANK']))
     deepspeed.init_distributed(dist_backend='hccl')
@@ -88,19 +107,25 @@ def main():
             'enabled': True
         },
         'zero_optimization': {
-            'stage': 2,
-            'overlap_comm': False
+            'stage': args.zero_stage,
+            'overlap_comm': False,
+            'reduce_bucket_size': 1000000,
         },
         'quantization': {
             'hifloat8': {
                 'enabled': True,
                 'module_name_patterns': ['dense', 'experts'],
-                'expected_module_count': 2
+                'expected_module_count': 2,
+                'min_numel': 16384,
             }
         },
         'steps_per_print': 10000,
     }
     generator = torch.Generator().manual_seed(123 + rank)
+    if args.zero_stage == 3:
+        config['zero_optimization']['stage3_prefetch_bucket_size'] = 0
+        config['zero_optimization']['stage3_param_persistence_threshold'] = 0
+        config['zero_optimization']['stage3_max_reuse_distance'] = 0
     if args.module_recipes:
         config['quantization']['hifloat8'].pop('module_name_patterns')
         config['quantization']['hifloat8']['module_configs'] = {
@@ -111,14 +136,29 @@ def main():
                 'grad_dst_type_max': 224
             },
         }
-    batches = [torch.randn(32, 128, generator=generator).bfloat16().to('npu') for _ in range(8)]
-    targets = [torch.randn(32, 128, generator=generator).bfloat16().to('npu') * 0.01 for _ in range(8)]
+    batches = [torch.randn(32, 128, generator=generator).bfloat16().to('npu') for _ in range(args.steps)]
+    for batch in batches:
+        batch.requires_grad_(args.checkpoint)
+    targets = [torch.randn(32, 128, generator=generator).bfloat16().to('npu') * 0.01 for _ in range(args.steps)]
 
     def create():
-        model = Model().bfloat16()
-        model.load_state_dict(initial)
+        if args.zero_init:
+            with deepspeed.zero.Init(config_dict_or_path=config, dtype=torch.bfloat16, remote_device='cpu'):
+                model = Model(args.checkpoint)
+            with deepspeed.zero.GatheredParameters(model.parameters(), modifier_rank=0):
+                if rank == 0:
+                    model.load_state_dict(initial)
+        else:
+            model = Model(args.checkpoint).bfloat16()
+            model.load_state_dict(initial)
+        if args.freeze_first_expert:
+            model.experts.w1.requires_grad_(False)
+        parameters = dict(model.named_parameters())
+        state_keys = tuple(model.state_dict())
         optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
         engine, _, _, _ = deepspeed.initialize(model=model, optimizer=optimizer, config=config)
+        assert tuple(engine.module.state_dict()) == state_keys
+        assert all(dict(engine.module.named_parameters())[name] is parameter for name, parameter in parameters.items())
         assert isinstance(engine.module.dense, HiFloat8Linear)
         assert isinstance(engine.module.experts.grouped_mm, HiFloat8GMM)
         if args.module_recipes:
@@ -128,38 +168,84 @@ def main():
             assert vars(engine.module.dense.config) == vars(engine.module.experts.grouped_mm.config)
         return engine
 
+    def model_snapshot(engine):
+        if args.zero_stage == 3:
+            with deepspeed.zero.GatheredParameters(engine.module.parameters()):
+                return snapshot(engine.module.state_dict())
+        return snapshot(engine.module.state_dict())
+
+    step_times = []
+    allocated_peaks = []
+    reserved_peaks = []
+
     def step(engine, i):
+        torch.npu.synchronize()
+        torch.npu.reset_peak_memory_stats()
+        started = time.perf_counter()
+        batches[i].grad = None
         loss = (engine(batches[i]).float() - targets[i].float()).square().mean()
+        assert bool(torch.isfinite(loss))
         engine.backward(loss)
         engine.step()
+        torch.npu.synchronize()
+        step_times.append(time.perf_counter() - started)
+        allocated_peaks.append(torch.npu.max_memory_allocated())
+        reserved_peaks.append(torch.npu.max_memory_reserved())
         return float(loss.detach())
 
     engine = create()
     losses = []
-    for i in range(8):
+    grad_norms = []
+    for i in range(args.steps):
         losses.append(step(engine, i))
+        if i % 2:
+            grad_norms.append(float(engine.get_global_grad_norm()))
+            assert math.isfinite(grad_norms[-1])
         if i == 3:
             assert engine.global_steps == 2
             engine.save_checkpoint(str(args.output / 'checkpoint'), tag='step2', client_state={'marker': 2})
-    final = snapshot(engine.module.state_dict())
+    final = model_snapshot(engine)
+    assert final.keys() == initial.keys()
+    assert all(value.shape == initial[name].shape for name, value in final.items())
+    assert any(not torch.equal(value, initial[name]) for name, value in final.items())
+    if args.freeze_first_expert:
+        assert torch.equal(final['experts.w1'], initial['experts.w1'])
     optimizer_final = snapshot(engine.optimizer.state_dict())
     resumed = create()
     path, state = resumed.load_checkpoint(str(args.output / 'checkpoint'), tag='step2')
     assert path and state['marker'] == 2 and resumed.global_steps == 2
-    resumed_losses = [step(resumed, i) for i in range(4, 8)]
+    resumed_losses = []
+    resumed_norms = []
+    for i in range(4, args.steps):
+        resumed_losses.append(step(resumed, i))
+        if i % 2:
+            resumed_norms.append(float(resumed.get_global_grad_norm()))
     assert resumed_losses == losses[4:]
-    compare_nested(final, resumed.module.state_dict())
+    assert resumed_norms == grad_norms[2:]
+    compare_nested(final, model_snapshot(resumed))
     compare_nested(optimizer_final, resumed.optimizer.state_dict())
-    assert resumed.global_steps == 4
+    assert resumed.global_steps == args.steps // 2
     args.output.mkdir(parents=True, exist_ok=True)
     result = {
         'rank': rank,
         'world_size': dist.get_world_size(),
-        'zero_stage': 2,
+        'zero_stage': args.zero_stage,
+        'zero_init': args.zero_init,
+        'frozen_first_expert': args.freeze_first_expert,
+        'activation_checkpointing': args.checkpoint,
         'gradient_accumulation_steps': 2,
-        'optimizer_steps': 4,
+        'optimizer_steps': args.steps // 2,
         'losses': losses,
         'resume_losses': resumed_losses,
+        'grad_norms': grad_norms,
+        'resume_grad_norms': resumed_norms,
+        'microstep_seconds': step_times[:args.steps],
+        'training_allocated_peak_bytes': max(allocated_peaks[:args.steps]),
+        'training_reserved_peak_bytes': max(reserved_peaks[:args.steps]),
+        'final_parameter_hashes': {
+            name: hashlib.sha256(value.contiguous().view(torch.uint8).numpy().tobytes()).hexdigest()
+            for name, value in final.items()
+        },
         'parameters_exact': True,
         'optimizer_exact': True,
         'same_policy_values': not args.module_recipes,

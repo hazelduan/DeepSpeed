@@ -4,6 +4,7 @@
 """Resolve training module selections and pass their recipes to TorchAO."""
 
 from fnmatch import fnmatchcase
+from math import prod
 import re
 
 import torch
@@ -13,6 +14,12 @@ from deepspeed.moe.ep_experts import GroupedExperts
 from deepspeed.utils import logger
 
 
+def _matrix_numel(parameter):
+    # zero.Init can leave no physical elements before a forward gather.
+    shape = getattr(parameter, "ds_shape", parameter.shape)
+    return prod(shape[-2:])
+
+
 def _select_modules(model, format_name, config):
     patterns = config["module_name_patterns"]
     min_numel = config["min_numel"]
@@ -20,10 +27,10 @@ def _select_modules(model, format_name, config):
     for name, module in model.named_modules():
         if patterns and not any(fnmatchcase(name, pattern) for pattern in patterns):
             continue
-        if type(module) is torch.nn.Linear and module.weight.numel() >= min_numel:
+        if type(module) is torch.nn.Linear and _matrix_numel(module.weight) >= min_numel:
             candidates[name] = module
         elif isinstance(module, GroupedExperts):
-            if min(module.w1[0].numel(), module.w2[0].numel(), module.w3[0].numel()) >= min_numel:
+            if min(_matrix_numel(weight) for weight in (module.w1, module.w2, module.w3)) >= min_numel:
                 candidates[name] = module
 
     if not candidates:

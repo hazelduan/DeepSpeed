@@ -2108,8 +2108,6 @@ class DeepSpeedEngine(Module):
             raise RuntimeError("HiFloat8 training has not been validated with a custom model-parallel unit")
         if any(isinstance(module, MoE) for module in model.modules()):
             raise RuntimeError("HiFloat8 experts require AutoEP, not the explicit DeepSpeed MoE layer")
-        if self.zero_optimization_stage() >= ZeroStageEnum.weights:
-            raise RuntimeError("HiFloat8 phase-1 supports DeepSpeed ZeRO stages 0, 1, and 2 only")
 
     def _configure_quantization(self):
         configs = {name: config for name, config in self._config.quantization_config.items() if config["enabled"]}
