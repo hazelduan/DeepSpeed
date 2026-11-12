@@ -52,11 +52,47 @@ section gives each training format its own module selection. HiFloat8 is the
 first supported format. Existing top-level `hifloat8` files and the
 `backend="torchao_npu"` alias still work. Use one location for HiFloat8 options.
 
+## Per-module recipes
+
+`module_configs` assigns numerical overrides to individual logical modules.
+For example, two projections can use different gradient ranges with one conversion
+pass. Expert names refer to their AutoEP containers.
+
+```json
+{
+  "bf16": {"enabled": true},
+  "quantization": {
+    "hifloat8": {
+      "enabled": true,
+      "config": {"weight_dst_type_max": 15},
+      "module_configs": {
+        "model.layers.0.self_attn.q_proj": {"grad_dst_type_max": 15},
+        "re:model\\.layers\\.[0-9]+\\.self_attn\\.q_proj": {"grad_dst_type_max": 224},
+        "re:model\\.layers\\.[0-9]+\\.mlp\\.experts": {"grad_dst_type_max": 224},
+        "_default": null
+      }
+    }
+  }
+}
+```
+
+Exact names take precedence over regular expressions. Regex keys start with `re:`
+and match the full module name. The first matching regex in JSON order wins,
+followed by `_default`. A dictionary overrides fields in the common `config`;
+`null` skips that module. Only eligible Linear and GroupedExperts modules
+participate in selection. Each explicit selector must match an eligible module.
+
+When `module_name_patterns` is also present, its globs restrict the scope and
+modules without an override inherit the common recipe. When only `module_configs`
+is supplied, unmatched modules are skipped. `expected_module_count` counts
+converted logical modules after null exclusions. The empty module name `""`
+selects a root Linear or GroupedExperts model.
+
 ## Conversion and device ownership
 
 The NPU accelerator resolves the public TorchAO `HiFloat8Config` class.
 DeepSpeed maps the selected Linear modules and AutoEP grouped GEMM leaves
-to the configuration using `FqnToConfig`. AO parses the recipe and converts
+to their configurations using `FqnToConfig`. AO parses every selected recipe before conversion and converts
 the modules in one `quantize_` call. DeepSpeed keeps expert parameters,
 activation, routing and padding on the expert container. The GEMM leaf
 receives packed weights and their layout on each call, so quantization
