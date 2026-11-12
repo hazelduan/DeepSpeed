@@ -74,6 +74,7 @@ def compare_nested(a, b):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--output', type=Path, required=True)
+    parser.add_argument('--module-recipes', action='store_true')
     args = parser.parse_args()
     rank = int(os.environ['RANK'])
     torch.npu.set_device(int(os.environ['LOCAL_RANK']))
@@ -100,6 +101,16 @@ def main():
         'steps_per_print': 10000,
     }
     generator = torch.Generator().manual_seed(123 + rank)
+    if args.module_recipes:
+        config['quantization']['hifloat8'].pop('module_name_patterns')
+        config['quantization']['hifloat8']['module_configs'] = {
+            'dense': {
+                'grad_dst_type_max': 15
+            },
+            'experts': {
+                'grad_dst_type_max': 224
+            },
+        }
     batches = [torch.randn(32, 128, generator=generator).bfloat16().to('npu') for _ in range(8)]
     targets = [torch.randn(32, 128, generator=generator).bfloat16().to('npu') * 0.01 for _ in range(8)]
 
@@ -110,7 +121,11 @@ def main():
         engine, _, _, _ = deepspeed.initialize(model=model, optimizer=optimizer, config=config)
         assert isinstance(engine.module.dense, HiFloat8Linear)
         assert isinstance(engine.module.experts.grouped_mm, HiFloat8GMM)
-        assert vars(engine.module.dense.config) == vars(engine.module.experts.grouped_mm.config)
+        if args.module_recipes:
+            assert engine.module.dense.config.grad_dst_type_max == 15
+            assert engine.module.experts.grouped_mm.config.grad_dst_type_max == 224
+        else:
+            assert vars(engine.module.dense.config) == vars(engine.module.experts.grouped_mm.config)
         return engine
 
     def step(engine, i):
@@ -147,7 +162,8 @@ def main():
         'resume_losses': resumed_losses,
         'parameters_exact': True,
         'optimizer_exact': True,
-        'same_policy_values': True
+        'same_policy_values': not args.module_recipes,
+        'module_recipes': args.module_recipes
     }
     (args.output / f'result_rank{rank}.json').write_text(json.dumps(result, indent=2))
     dist.barrier()

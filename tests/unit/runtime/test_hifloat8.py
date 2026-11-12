@@ -157,7 +157,7 @@ class _ToyModel(nn.Module):
         self.model.self_attn = nn.ModuleDict({"q_proj": nn.Linear(4, 4, bias=False)})
 
 
-def _make_engine(model, patterns, min_numel=0):
+def _make_engine(model, patterns, min_numel=0, module_configs=None):
     engine = object.__new__(DeepSpeedEngine)
     nn.Module.__init__(engine)
     engine._config = SimpleNamespace(
@@ -165,6 +165,7 @@ def _make_engine(model, patterns, min_numel=0):
             "enabled": True,
             "module_name_patterns": tuple(patterns),
             "min_numel": min_numel,
+            "module_configs": module_configs,
         },
         bfloat16_config=SimpleNamespace(enabled=True),
         tensor_parallel_config=SimpleNamespace(autotp_size=1),
@@ -373,7 +374,8 @@ def test_removed_configuration_extension_reports_existing_schema():
 
 @requires_npu
 @pytest.mark.parametrize("kind", ["mixed", "linear", "grouped"])
-def test_public_quantize_entry_converts_dense_and_grouped_in_place(monkeypatch, kind):
+@pytest.mark.parametrize("use_mapping", [False, True])
+def test_public_quantize_entry_converts_dense_and_grouped_in_place(monkeypatch, kind, use_mapping):
     # A split expert path would bypass the public API; wrap the real collaborator.
     import torchao.quantization as quantization
     from torchao.hifloat8 import HiFloat8GMM, HiFloat8Linear
@@ -403,7 +405,11 @@ def test_public_quantize_entry_converts_dense_and_grouped_in_place(monkeypatch, 
         return original(actual_model, config, **kwargs)
 
     monkeypatch.setattr(quantization, "quantize_", counted)
-    engine = _make_engine(model, patterns)
+    module_configs = None
+    if use_mapping:
+        module_configs = {name: {} for name in (["dense", "experts"] if kind == "mixed" else [""])}
+        patterns = []
+    engine = _make_engine(model, patterns, module_configs=module_configs)
     engine.device = torch.device("npu:0")
     engine._configure_quantization()
     assert calls == [model]
@@ -447,3 +453,128 @@ def test_invalid_training_quantization_sections_fail_closed(options):
 def test_invalid_module_recipe_structure_fails_during_config_parsing(module_configs):
     with pytest.raises(DeepSpeedConfigError):
         get_quantization_config({"quantization": {"hifloat8": {"module_configs": module_configs}}})
+
+
+@pytest.mark.parametrize("module_configs", [{"missing": {}}, {"re:.*missing": {}}, {"_default": None}])
+def test_module_recipe_selection_errors_preserve_the_model(module_configs):
+    model = _ToyModel()
+    before = dict(model.named_parameters())
+    engine = _make_engine(model, [], module_configs=module_configs)
+    with pytest.raises(RuntimeError, match="matched no"):
+        engine._configure_quantization()
+    assert all(type(module) is nn.Linear for module in model.model.mlp.values())
+    assert all(dict(model.named_parameters())[name] is value for name, value in before.items())
+
+
+@requires_npu
+@pytest.mark.parametrize("scoped", [False, True])
+def test_module_recipes_match_explicit_ao_reference_with_one_conversion(monkeypatch, scoped):
+    # Catches wrong precedence, ignored per-module recipes and lost optimizer parameters.
+    import copy
+    import torchao.quantization as quantization
+    from torchao.hifloat8 import HiFloat8Config
+    from deepspeed.moe.ep_experts import GroupedExperts
+
+    torch.manual_seed(113)
+    model = nn.ModuleDict({
+        "dense_a": nn.Linear(64, 64),
+        "dense_b": nn.Linear(64, 64),
+        "dense_c": nn.Linear(64, 64),
+        "experts_a": GroupedExperts(64, 64, 2, use_grouped_mm=False),
+        "experts_b": GroupedExperts(64, 64, 2, use_grouped_mm=False),
+        "untouched": nn.Linear(64, 64),
+        "embedding": nn.Embedding(8, 64),
+    }).to(device="npu", dtype=torch.bfloat16)
+    with torch.no_grad():
+        for parameter in model.parameters():
+            parameter.normal_(std=0.02)
+    model["experts_b"].w1.requires_grad_(False)
+    reference = copy.deepcopy(model)
+    parameters = dict(model.named_parameters())
+    keys = tuple(model.state_dict())
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+    reference_optimizer = torch.optim.SGD(reference.parameters(), lr=0.01)
+    common = {"input_dst_type_max": 15, "weight_dst_type_max": 31, "grad_dst_type_max": 224}
+    reference_configs = {}
+    for name in ("dense_a", "dense_b", "dense_c", "experts_a", "experts_b"):
+        policy = dict(common)
+        grouped = name.startswith("experts")
+        policy["grad_dst_type_max"] = 31 if grouped else 127
+        if name == "dense_a":
+            policy.update(grad_dst_type_max=15, compute_dtype="float16")
+        recipe = HiFloat8Config.from_dict({"grouped" if grouped else "linear": policy})
+        reference_configs[f"{name}.grouped_mm" if grouped else name] = recipe
+    quantization.quantize_(reference, quantization.FqnToConfig(reference_configs), filter_fn=None)
+
+    calls = []
+    original = quantization.quantize_
+
+    def counted(actual_model, config, **kwargs):
+        calls.append(actual_model)
+        return original(actual_model, config, **kwargs)
+
+    monkeypatch.setattr(quantization, "quantize_", counted)
+    module_configs = {
+        "re:experts_[ab]": {
+            "grad_dst_type_max": 31
+        },
+        "re:.*": {
+            "grad_dst_type_max": 127
+        },
+        "dense_a": {
+            "grad_dst_type_max": 15,
+            "compute_dtype": "float16"
+        },
+        "untouched": None,
+        "_default": None,
+    }
+    patterns = ["dense_*", "experts_*", "untouched"] if scoped else []
+    engine = _make_engine(model, patterns, module_configs=module_configs)
+    engine._config.hifloat8_config["config"] = {"weight_dst_type_max": 31}
+    engine._config.hifloat8_config["expected_module_count"] = 5
+    engine._configure_quantization()
+    assert calls == [model]
+    assert tuple(model.state_dict()) == keys
+    assert type(model["untouched"]) is nn.Linear
+    assert all(dict(model.named_parameters())[name] is value for name, value in parameters.items())
+
+    def forward(module, value):
+        counts = torch.tensor([0, value.shape[0]], device=value.device, dtype=torch.int64)
+        hidden = module["dense_a"](value) + module["dense_b"](value)
+        return module["experts_a"](hidden, counts) + module["experts_b"](module["dense_c"](value), counts)
+
+    value = torch.randn(16, 64, device="npu", dtype=torch.bfloat16, requires_grad=True)
+    ref_value = value.detach().clone().requires_grad_()
+    actual, expected = forward(model, value), forward(reference, ref_value)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    actual.float().square().mean().backward()
+    expected.float().square().mean().backward()
+    torch.testing.assert_close(value.grad, ref_value.grad, rtol=0, atol=0)
+    for name, parameter in model.named_parameters():
+        ref_parameter = dict(reference.named_parameters())[name]
+        torch.testing.assert_close(parameter.grad, ref_parameter.grad, rtol=0, atol=0)
+    optimizer.step()
+    reference_optimizer.step()
+    for name, value in model.state_dict().items():
+        torch.testing.assert_close(value, reference.state_dict()[name], rtol=0, atol=0)
+
+
+@requires_npu
+def test_late_invalid_module_recipe_fails_before_any_conversion():
+    # A valid first recipe must not mutate the model before a later recipe fails AO validation.
+    model = nn.ModuleDict({"first": nn.Linear(8, 8), "last": nn.Linear(8, 8)})
+    engine = _make_engine(model, [], module_configs={"first": {}, "last": {"compute_dtype": "float32"}})
+    with pytest.raises(RuntimeError, match="recipe failed before conversion"):
+        engine._configure_quantization()
+    assert all(type(module) is nn.Linear for module in model.values())
+
+
+@requires_npu
+def test_default_module_recipe_converts_only_eligible_modules():
+    model = nn.ModuleDict({"dense": nn.Linear(8, 8), "skip": nn.Linear(8, 8), "embedding": nn.Embedding(8, 8)})
+    engine = _make_engine(model, [], module_configs={"skip": None, "_default": {"grad_dst_type_max": 15}})
+    engine._config.hifloat8_config["expected_module_count"] = 1
+    engine._configure_quantization()
+    assert model["dense"].config.grad_dst_type_max == 15
+    assert type(model["skip"]) is nn.Linear
+    assert type(model["embedding"]) is nn.Embedding
