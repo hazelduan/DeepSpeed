@@ -322,11 +322,18 @@ def gather_rows(src: torch.Tensor, index: torch.Tensor) -> torch.Tensor:
 
     The forward kernel of :func:`permute_rows`. ``generate_permute_indices``
     marks padding slots with -1, so this reads a permuted, alignment-padded
-    buffer in one pass, without first appending a zero row to ``src``. ``src``
-    is a 2-D CUDA tensor and ``index`` a 1-D integer tensor on its device. The
+    buffer without first appending a zero row to ``src``. CUDA uses a Triton
+    gather; NPU uses native gather and padding masking. ``src`` is a 2-D device
+    tensor and ``index`` a 1-D integer tensor on its device. The
     kernel is invisible to autograd; :func:`permute_rows` is the differentiable
     reorder.
     """
+    if src.device.type == "npu":
+        if src.shape[0] == 0:
+            return src.new_zeros((index.numel(), src.shape[1]))
+        valid = (index >= 0) & (index < src.shape[0])
+        out = src.index_select(0, index.clamp(0, src.shape[0] - 1).to(torch.int64))
+        return out.masked_fill_(~valid[:, None], 0)
     # The kernel addresses both by linear offset.
     src = src.contiguous()
     index = index.contiguous()
@@ -425,8 +432,8 @@ def unpermute_rows(rows: torch.Tensor, permuted_indices: torch.Tensor, num_rows:
 
 
 def permute_rows_supported(rows: torch.Tensor) -> bool:
-    """Whether :func:`permute_rows` and :func:`unpermute_rows` can take ``rows``: 2-D, on CUDA, with Triton."""
-    return _TRITON_AVAILABLE and rows.device.type == "cuda" and rows.dim() == 2
+    """Whether the device has a gather implementation for 2-D expert rows."""
+    return rows.dim() == 2 and (rows.device.type == "npu" or (_TRITON_AVAILABLE and rows.device.type == "cuda"))
 
 
 # ===================================================================

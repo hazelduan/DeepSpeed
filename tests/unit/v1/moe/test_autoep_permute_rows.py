@@ -2,11 +2,13 @@
 # DeepSpeed Team
 """The gather-based AutoEP expert reorder against the zero-row-and-index reference, compared with torch.equal."""
 
+import os
+
 import pytest
 import torch
 
 from deepspeed.accelerator import get_accelerator
-from deepspeed.module_inject.auto_ep_layer import permute_by_local_expert, unpermute_by_local_expert
+from deepspeed.module_inject.auto_ep_layer import combine_from_routed, permute_by_local_expert, unpermute_by_local_expert
 from deepspeed.moe import ep_kernels
 from unit.common import DistributedTest
 
@@ -129,12 +131,61 @@ def test_npu_permutation_accepts_host_counts():
     assert torch.equal(tokens.grad, reference_tokens.grad)
 
 
-@pytest.mark.skipif(get_accelerator().device_name() != "cuda" or not ep_kernels._TRITON_AVAILABLE,
-                    reason="the gather-based reorder needs CUDA and Triton")
+@pytest.mark.skipif(get_accelerator().device_name() != "npu"
+                    and (get_accelerator().device_name() != "cuda" or not ep_kernels._TRITON_AVAILABLE),
+                    reason="the gather-based reorder needs NPU or CUDA with Triton")
 class TestAutoEPPermuteRows(DistributedTest):
     # DeepSpeed imports can initialize CUDA during collection; the runner starts clean workers even under --forked.
     world_size = 1
     init_distributed = False
+
+    @pytest.mark.skipif(get_accelerator().device_name() != "npu" or os.environ.get("RUN_LARGE_AUTOEP_TESTS") != "1",
+                        reason="opt-in NPU regression requires about 21 GiB of free device memory")
+    def test_large_expert_buffer_restores_values_and_gradients(self):
+        # The former IndexPut path silently corrupted this >2**31-element BF16 buffer.
+        count, hidden, top_k = 786432, 3072, 8
+        rows = torch.ones(count, hidden, device=_device(), dtype=torch.bfloat16, requires_grad=True)
+        indices = torch.arange(count - 1, -1, -1, device=_device(), dtype=torch.int64)
+        scores = torch.full((count // top_k, top_k), 1 / top_k, device=_device())
+        restored = ep_kernels.unpermute_rows(rows, indices, count)
+        assert bool((restored == 1).all())
+        restored.backward(torch.full_like(restored, .25))
+        assert bool((rows.grad == .25).all())
+        del restored
+        rows.grad = None
+        out = combine_from_routed(rows, scores, indices, top_k, "post", "weighted_sum", (96, 1024, hidden))
+        assert bool((out == 1).all())
+        out.backward(torch.ones_like(out))
+        assert bool((rows.grad == .125).all())
+
+    @pytest.mark.parametrize("score_apply,combine_impl", [("pre", "weighted_sum"), ("post", "weighted_sum"),
+                                                          ("post", "legacy_bmm")])
+    def test_combine_restores_assignment_order_and_gradients(self, score_apply, combine_impl):
+        # Catches applying scores in expert order or gathering the wrong row gradient.
+        rows = torch.randn(48, 32, device=_device(), dtype=torch.bfloat16)
+        scores = torch.rand(12, 4, device=_device())
+        permutation = torch.randperm(48, device=_device())
+        upstream = torch.randn(1, 12, 32, device=_device(), dtype=rows.dtype)
+        results = []
+        for reference in (True, False):
+            values, weights = rows.clone().requires_grad_(), scores.clone().requires_grad_()
+            if reference:
+                restored = torch.zeros_like(values)
+                restored[permutation] = values
+                restored = restored.reshape(12, 4, 32)
+                if score_apply == "pre":
+                    out = restored.sum(1)
+                elif combine_impl == "legacy_bmm":
+                    out = torch.bmm(weights[:, None], restored.float()).to(rows.dtype).squeeze(1)
+                else:
+                    out = (restored * weights[..., None]).sum(1).to(rows.dtype)
+                out = out.reshape(1, 12, 32)
+            else:
+                out = combine_from_routed(values, weights, permutation, 4, score_apply, combine_impl, (1, 12, 32))
+            inputs = (values, weights) if score_apply == "post" else (values, )
+            results.append((out, *torch.autograd.grad(out, inputs, upstream)))
+        for actual, expected in zip(results[1], results[0]):
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
     @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
     @pytest.mark.parametrize("hidden", [2048, 100, 1])

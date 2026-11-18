@@ -1,0 +1,51 @@
+{
+  "bf16": {
+    "enabled": true
+  },
+  "communication_data_type": "bf16",
+  "zero_optimization": {
+    "stage": 2,
+    "overlap_comm": false,
+    "contiguous_gradients": true
+  },
+  "optimizer": {
+    "type": "AdamW",
+    "params": {
+      "lr": "auto",
+      "betas": "auto",
+      "eps": "auto",
+      "weight_decay": "auto",
+      "torch_adam": true
+    }
+  },
+  "expert_parallel": {
+    "enabled": true,
+    "autoep_size": 8,
+    "preset_model": "qwen3_5_moe",
+    "comm_backend": "comm"
+  },
+  "gradient_accumulation_steps": "auto",
+  "gradient_clipping": "auto",
+  "train_batch_size": "auto",
+  "train_micro_batch_size_per_gpu": "auto",
+  "steps_per_print": 1000,
+  "quantization": {
+    "hifloat8": {
+      "enabled": true,
+      "module_name_patterns": [
+        "*.experts",
+        "*.self_attn.q_proj",
+        "*.self_attn.o_proj",
+        "*.linear_attn.in_proj_qkv",
+        "*.linear_attn.in_proj_z",
+        "*.linear_attn.out_proj"
+      ],
+      "min_numel": 65536,
+      "backend": "torchao",
+      "expected_module_count": 180,
+      "module_configs": {
+        "_default": {}
+      }
+    }
+  }
+}

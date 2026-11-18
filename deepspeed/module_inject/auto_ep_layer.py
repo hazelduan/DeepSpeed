@@ -476,11 +476,14 @@ def combine_from_routed(
     bsz, seqlen, hdim = shape
     T = bsz * seqlen
 
-    # Create output tensor
-    output = torch.zeros(T * top_k, hdim, dtype=expert_output.dtype, device=expert_output.device)
+    from deepspeed.moe.ep_kernels import unpermute_rows
 
-    # Place expert outputs back in unsorted order
-    output[token_indices_sorted] = expert_output
+    if expert_output.device.type == "npu":
+        # Avoid a full-sized scatter and NPU IndexPut failures on large expert buffers.
+        output = unpermute_rows(expert_output, token_indices_sorted, T * top_k)
+    else:
+        output = torch.zeros(T * top_k, hdim, dtype=expert_output.dtype, device=expert_output.device)
+        output[token_indices_sorted] = expert_output
 
     # Reshape to [T, K, H]
     output = output.reshape(T, top_k, hdim)
@@ -1126,7 +1129,9 @@ class AutoEPMoELayer(nn.Module):
             return self._finalize_output(output, x, hidden_states, hdim)
 
         # Reorder tokens into expert-contiguous order.
-        token_indices_sorted = torch.argsort(ro.selected_experts.view(-1), stable=True)
+        sort_assignments = getattr(self, "experimental_sort_assignments", None)
+        token_indices_sorted = (sort_assignments(ro.selected_experts) if sort_assignments is not None else
+                                torch.argsort(ro.selected_experts.view(-1), stable=True))
         top_scores_sorted = ro.top_scores.view(-1)[token_indices_sorted]
         expert_indices_sorted = ro.selected_experts.reshape(-1).index_select(0, token_indices_sorted)
 
@@ -1174,10 +1179,13 @@ class AutoEPMoELayer(nn.Module):
             top_scores_for_compute = top_scores_sorted
             expert_indices_for_plan = expert_indices_sorted
 
-        routed_input = x[token_indices_for_compute // self.top_k]  # [N, H]
-        routed_input = apply_scores_before_experts_if_enabled(routed_input,
-                                                              top_scores_for_compute,
-                                                              score_apply=self.score_apply)
+        source_dispatch = getattr(self, "experimental_source_dispatch", None)
+        routed_input = None
+        if source_dispatch is None:
+            routed_input = x[token_indices_for_compute // self.top_k]  # [N, H]
+            routed_input = apply_scores_before_experts_if_enabled(routed_input,
+                                                                  top_scores_for_compute,
+                                                                  score_apply=self.score_apply)
 
         if self.ep_size == 1:
             # No AllToAll needed - local computation only
@@ -1209,14 +1217,20 @@ class AutoEPMoELayer(nn.Module):
                     num_tokens_per_expert=ro.num_tokens_per_expert,
                 )
 
-            routed_input = _AllToAllV.apply(self.ep_group, routed_input, plan.input_splits, plan.output_splits)
+            experimental_dispatch = getattr(self, "experimental_expert_dispatch", None)
+            if source_dispatch is not None:
+                expert_output = source_dispatch(x, token_indices_for_compute, plan, ro.num_tokens_per_expert)
+            elif experimental_dispatch is not None:
+                expert_output = experimental_dispatch(routed_input, plan, ro.num_tokens_per_expert)
+            else:
+                routed_input = _AllToAllV.apply(self.ep_group, routed_input, plan.input_splits, plan.output_splits)
 
-            routed_input, perm_indices, aligned_counts, n_tokens = permute_by_local_expert(
-                routed_input, plan.local_counts_by_source)
-            expert_output = self.experts(routed_input, aligned_counts)
-            expert_output = unpermute_by_local_expert(expert_output, perm_indices, n_tokens)
+                routed_input, perm_indices, aligned_counts, n_tokens = permute_by_local_expert(
+                    routed_input, plan.local_counts_by_source)
+                expert_output = self.experts(routed_input, aligned_counts)
+                expert_output = unpermute_by_local_expert(expert_output, perm_indices, n_tokens)
 
-            expert_output = _AllToAllV.apply(self.ep_group, expert_output, plan.output_splits, plan.input_splits)
+                expert_output = _AllToAllV.apply(self.ep_group, expert_output, plan.output_splits, plan.input_splits)
 
         if folded_tp:
             output = restore_combined(expert_output,
