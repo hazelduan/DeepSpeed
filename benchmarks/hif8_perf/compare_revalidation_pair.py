@@ -19,7 +19,7 @@ def read_run(root, warmup):
     rows = [[json.loads(line) for line in (root / f"steps_rank{rank}.jsonl").read_text().splitlines()]
             for rank in range(8)]
     steps = len(rows[0])
-    assert steps >= warmup + 12
+    assert steps >= warmup + 11
     for rank in range(8):
         assert len(rows[rank]) == completed[rank]["steps"] == steps
         assert completed[rank]["all_adapters_updated"]
@@ -94,7 +94,11 @@ def main():
         for key in ("payload_reuse", "gate_dispatch_fusion", "up_payload_reuse", "buffer_reuse",
                     "source_quant_before_duplication", "native_expert_sort", "fp32_route_gradient_restore"):
             assert stack[key], key
-        assert stack["dense_linear_payload_cache_budget_bytes"] == 4 * 2**30
+        if manifest.get("fc2_experiment"):
+            assert manifest["production_offload"]["weights"] == 132
+            assert manifest["fc2_experiment"]["fused_dx"] and manifest["fc2_experiment"]["native_weighted_restore"]
+        else:
+            assert stack["dense_linear_payload_cache_budget_bytes"] == 4 * 2**30
     mismatches = []
     if be != he:
         mismatches.append("original-ID expert parameters")

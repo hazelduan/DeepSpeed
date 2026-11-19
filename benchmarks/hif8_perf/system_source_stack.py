@@ -4,7 +4,7 @@
 import functools
 import types
 import torch
-import torch.distributed as dist
+from deepspeed import comm as dist
 from deepspeed.module_inject.auto_ep_layer import AutoEPMoELayer
 from source_gate_dispatch import SourceGateDispatch
 from source_pack import sorted_assignments
@@ -21,7 +21,7 @@ def source_dispatch(self, x, order, plan, counts):
     gate, tokens, payload, scale, inverse = SourceGateDispatch.apply(x, self.experts.w1, self.ep_group,
                                                                      self._fused_gate_hcom, sent, received, config,
                                                                      order, self.top_k)
-    return expert_after_gate(self, gate, tokens, payload, scale, inverse, plan, config)
+    return expert_after_gate(self, gate, tokens, payload, scale, inverse, plan, config, (sent, received))
 
 
 original_init = AutoEPMoELayer.__init__

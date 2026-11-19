@@ -6,6 +6,7 @@ output=${2:?Provide a fresh output directory}
 steps=${3:-20}
 here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 repo=$(cd -- "$here/../.." && pwd)
+ds_root=$repo
 
 : "${HIF8_PERF_MODEL:?Set HIF8_PERF_MODEL to the local Qwen3.5-122B-A10B checkpoint}"
 : "${HIF8_PERF_DATASET:?Set HIF8_PERF_DATASET to the conversation SFT JSONL}"
@@ -17,13 +18,14 @@ plugins=("$here/expert_lora_plugin.py")
 checkpoint_args=()
 case "$mode" in
     bf16)
+        ds_root=${HIF8_PERF_BF16_DS_ROOT:-$repo}
         export HCCL_BUFFSIZE=1024
         plugins+=("$here/lora_audit_stock.py")
         ;;
     hifloat8)
         : "${HIF8_PERF_AO_ROOT:?Set HIF8_PERF_AO_ROOT to the matching TorchAO Ascend checkout}"
         : "${SYSTEM_ROUTING_PROFILE:?Set SYSTEM_ROUTING_PROFILE to the full-model routing profile JSON}"
-        export HCCL_BUFFSIZE=256 DENSE_LINEAR_CACHE_BYTES=4294967296 HIF8_CE_BLOCK_ROWS=512
+        export HCCL_BUFFSIZE=256 DENSE_LINEAR_CACHE_BYTES=0 HIF8_CE_BLOCK_ROWS=512
         checkpoint_args=(--gradient_checkpointing_kwargs '{"use_reentrant": false}')
         plugins+=("$here/fused_gate_lora_plugin.py" "$here/system_stack.py" "$here/system_source_stack.py"
                   "$here/lora_audit_source_cached.py")
@@ -34,7 +36,7 @@ case "$mode" in
         ;;
 esac
 
-export PYTHONPATH="$here:$repo${HIF8_PERF_AO_ROOT:+:$HIF8_PERF_AO_ROOT}${PYTHONPATH:+:$PYTHONPATH}"
+export PYTHONPATH="$here:$ds_root${HIF8_PERF_AO_ROOT:+:$HIF8_PERF_AO_ROOT}${PYTHONPATH:+:$PYTHONPATH}"
 export ASCEND_RT_VISIBLE_DEVICES="${ASCEND_RT_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 export DS_ACCELERATOR=npu OMP_NUM_THREADS=4 PYTHONHASHSEED=42 HCCL_CONNECT_TIMEOUT=180
 export PRECISION_FULL_FINGERPRINTS=1 HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1 TOKENIZERS_PARALLELISM=false
@@ -55,12 +57,14 @@ from pathlib import Path
 
 config = json.loads(Path(sys.argv[1]).read_text())
 config["quantization"]["hifloat8"]["enabled"] = sys.argv[3] == "hifloat8"
+if sys.argv[3] == "hifloat8":
+    config["quantization"]["hifloat8"]["offload_frozen_linear_weights"] = True
 Path(sys.argv[2]).write_text(json.dumps(config, indent=2) + "\n")
 PY
 
 plugins+=("$here/gdn_provider.py" "$here/resource_step_windows.py")
 if [[ "$mode" == hifloat8 ]]; then
-    plugins+=("$here/native_restore_input.py" "$here/hif8_loss_blocks.py")
+    plugins+=("$here/native_restore_input.py" "$here/hif8_loss_blocks.py" "$here/fc2_audit.py")
 fi
 plugins+=("$here/post_training_integrity.py")
 

@@ -33,6 +33,10 @@ class CachedSourceAudit(SourceAudit):
         quantized = self.counts['npu_quantize_input_elements']
         wire = self.counts['npu_alltoallv_quant_gmm_input_elements']
         if self.engine.hifloat8_enabled():
+            from fc2_combine import COUNTS
+
+            quantized -= COUNTS["down_grad_quantized_elements"]
+            wire -= COUNTS["down_grad_quantized_elements"]
             assert quantized * self.layers[0][1].top_k == wire, 'Source tokens were redundantly quantized'
         if stats:
             assert stats['bytes'] <= stats['budget_bytes']

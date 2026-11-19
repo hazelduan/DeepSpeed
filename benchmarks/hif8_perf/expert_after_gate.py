@@ -7,7 +7,7 @@ from deepspeed.moe.ep_experts import apply_expert_activation
 from fused_gate_dispatch import PrequantizedFrozenGMM
 
 
-def expert_after_gate(layer, gate, tokens, payload, scale, inverse, plan, config):
+def expert_after_gate(layer, gate, tokens, payload, scale, inverse, plan, config, route_counts=None):
     experts = layer.experts
     offsets = plan.local_counts_by_source.sum(0).cumsum(0).to(torch.int64)
     gate.add_(experts.lora1(tokens, offsets))
@@ -21,6 +21,10 @@ def expert_after_gate(layer, gate, tokens, payload, scale, inverse, plan, config
                                      experts.activation_limit,
                                      fused=False)
     del gate, up, tokens, payload, scale
+    if config is not None and route_counts is not None:
+        from fc2_combine import combine_fc2
+
+        return combine_fc2(layer, hidden, offsets, inverse, plan, config, *route_counts)
     output = experts.grouped_mm(hidden, experts.w2, offsets, trans_b=True)
     output.add_(experts.lora2(hidden, offsets))
     return _AllToAllV.apply(layer.ep_group, output.index_select(0, inverse), plan.output_splits, plan.input_splits)
