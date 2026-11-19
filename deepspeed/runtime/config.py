@@ -397,14 +397,15 @@ def _parse_hifloat8_config(config):
     if not isinstance(config, dict):
         raise DeepSpeedConfigError(f"'{HIFLOAT8}' must be an object, got {type(config).__name__}")
 
-    unknown = sorted(set(config) - set(HIFLOAT8_DEFAULT))
+    unknown = sorted(config.keys() - HIFLOAT8_DEFAULT.keys() - {"offload_frozen_linear_weights"})
     if unknown:
         raise DeepSpeedConfigError(f"Unknown '{HIFLOAT8}' fields: {unknown}")
 
     result = dict(HIFLOAT8_DEFAULT)
     result.update(config)
-    if not isinstance(result["enabled"], bool):
-        raise DeepSpeedConfigError("'hifloat8.enabled' must be a boolean")
+    for flag in ("enabled", "offload_frozen_linear_weights"):
+        if not isinstance(result.get(flag, False), bool):
+            raise DeepSpeedConfigError(f"'hifloat8.{flag}' must be a boolean")
     if result["backend"] == "torchao_npu":
         result["backend"] = "torchao"
     if result["backend"] != "torchao":

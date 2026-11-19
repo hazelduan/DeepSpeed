@@ -184,14 +184,18 @@ class _ChunkedCrossEntropy(torch.autograd.Function):
         # d loss_i / d logit_ij = softmax_ij - [j == target_i], scaled by the incoming gradient of row i.
         row_scale = torch.where(valid, grad_loss.float(), torch.zeros_like(log_sum_exp))
         grad_logits = torch.empty_like(logits)
-        n_rows = logits.shape[0]
+        n_rows, n_cols = logits.shape
+        # Separate storage keeps the saved logits intact when they already have FP32 dtype.
+        workspace = torch.empty((min(n_rows, ctx.block_rows), n_cols), dtype=torch.float32, device=logits.device)
         for start in range(0, n_rows, ctx.block_rows):
             end = min(start + ctx.block_rows, n_rows)
-            probabilities = torch.exp(logits[start:end].float() - log_sum_exp[start:end].unsqueeze(-1))
+            probabilities = workspace[:end - start]
+            probabilities.copy_(logits[start:end])
+            probabilities.sub_(log_sum_exp[start:end].unsqueeze(-1)).exp_()
             probabilities.scatter_add_(-1, safe_target[start:end].unsqueeze(-1),
                                        -torch.ones_like(probabilities[:, :1]))
             probabilities.mul_(row_scale[start:end].unsqueeze(-1))
-            grad_logits[start:end] = probabilities.to(grad_logits.dtype)
+            grad_logits[start:end].copy_(probabilities)
         return grad_logits, None, None, None
 
 

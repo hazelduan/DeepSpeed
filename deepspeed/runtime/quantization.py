@@ -3,7 +3,9 @@
 # DeepSpeed Team
 """Resolve training module selections and pass their recipes to TorchAO."""
 
+from collections import Counter
 from fnmatch import fnmatchcase
+from itertools import chain
 import re
 
 import torch
@@ -116,3 +118,35 @@ def configure_training_quantization(model, configs, device):
         logger.info("Training quantization %s converted %d Linear and %d AutoEP modules", format_name, len(linears),
                     len(experts))
     return selections
+
+
+def offload_frozen_hifloat8_linear_weights(model, module_names, collect_sources):
+    """Offload eligible frozen weights after broadcast and before optimizer setup."""
+    from deepspeed.module_inject.auto_ep_layer import ReplacementSourceMap
+    from torchao.hifloat8 import HiFloat8Linear
+
+    if not hasattr(HiFloat8Linear, "offload_frozen_weight"):
+        raise RuntimeError("HiFloat8 frozen Linear weight offload requires TorchAO NPU with offload_frozen_weight")
+
+    def storage_key(tensor):
+        return tensor.device, tensor.untyped_storage().data_ptr()
+
+    tensors = chain(model.named_parameters(remove_duplicate=False), model.named_buffers(remove_duplicate=False))
+    owners = Counter(
+        storage_key(tensor) for _, tensor in tensors
+        if tensor.device.type == "npu" and tensor.layout == torch.strided and tensor.numel())
+    sources = ReplacementSourceMap()
+    offloaded = 0
+    for name in module_names:
+        layer = model.get_submodule(name)
+        weight = layer.weight
+        if weight.device.type != "npu" or weight.layout != torch.strided or owners[storage_key(weight)] != 1:
+            continue
+        if not layer.offload_frozen_weight():
+            continue
+        if collect_sources:
+            sources.sources[id(layer.weight)] = [weight]
+            sources.discarded.add(id(weight))
+        offloaded += 1
+    logger.info("HiFloat8 offloaded %d frozen Linear weights to CPU", offloaded)
+    return sources

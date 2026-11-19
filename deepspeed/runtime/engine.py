@@ -628,7 +628,7 @@ class DeepSpeedEngine(Module):
 
         # Configure distributed model
         self._configure_distributed_model(model)
-        self._configure_quantization()
+        self._configure_quantization(model_parameters if eager_model_parameters else None)
 
         # These hooks should be disabled later if DeepCompile is not active.
         self.module_forward_pre_hook = self._create_module_forward_pre_hook()
@@ -2110,8 +2110,11 @@ class DeepSpeedEngine(Module):
             raise RuntimeError("HiFloat8 experts require AutoEP, not the explicit DeepSpeed MoE layer")
         if self.zero_optimization_stage() >= ZeroStageEnum.weights:
             raise RuntimeError("HiFloat8 phase-1 supports DeepSpeed ZeRO stages 0, 1, and 2 only")
+        if (self._config.hifloat8_config.get("offload_frozen_linear_weights")
+                and self.zero_optimization_stage() != ZeroStageEnum.gradients):
+            raise RuntimeError("HiFloat8 frozen Linear weight offload requires ZeRO stage 2")
 
-    def _configure_quantization(self):
+    def _configure_quantization(self, model_parameters=None):
         configs = {name: config for name, config in self._config.quantization_config.items() if config["enabled"]}
         if not configs:
             return
@@ -2121,6 +2124,14 @@ class DeepSpeedEngine(Module):
         selections = configure_training_quantization(self.module, configs, self.device)
         if "hifloat8" in selections:
             self.hifloat8_converted_module_names, self.hifloat8_grouped_module_names = selections["hifloat8"]
+            if configs["hifloat8"].get("offload_frozen_linear_weights"):
+                from .quantization import offload_frozen_hifloat8_linear_weights
+
+                collect_sources = model_parameters is not None or _client_optimizer_needs_remap(self.client_optimizer)
+                sources = offload_frozen_hifloat8_linear_weights(self.module, self.hifloat8_converted_module_names,
+                                                                 collect_sources)
+                _remap_client_optimizer_after_module_replacement(self.client_optimizer, self.module, sources)
+                _remap_model_parameters_after_module_replacement(model_parameters, self.module, sources)
 
     def _configure_distributed_model(self, model):
         self._set_client_model(model)
